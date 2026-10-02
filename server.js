@@ -30,6 +30,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const mongoose = require('mongoose');
 
 // Import domain schemas
@@ -95,9 +96,21 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 // Serve static assets from the public directory (Frontend UI)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Explicit root route serving index.html to guarantee zero 'Cannot GET /' errors
+// Explicit root route: serves frontend if present, otherwise returns clean API status
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  const indexPath = path.join(__dirname, 'public', 'index.html');
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
+  return res.json({
+    status: 'online',
+    message: 'Task Manager API is running live on Render',
+    endpoints: {
+      tasks: '/tasks',
+      users: '/users',
+      health: '/api/health'
+    }
+  });
 });
 
 // Request logging for diagnostics in development
