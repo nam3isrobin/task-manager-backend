@@ -3,11 +3,19 @@
  * User Model (`models/User.js`)
  * ==============================================================================
  * Represents a registered user in the Task Manager ecosystem.
- * Supports Assignment 4: Multi-user architecture linking tasks to user profiles.
+ *
+ * Capabilities & Security Architecture:
+ * - Multi-user tenancy: Binds tasks securely to authenticated user profiles.
+ * - Password Security: Hashes plain-text passwords using bcryptjs (salt rounds: 10)
+ *   in a Mongoose pre-save hook.
+ * - Confidentiality: `select: false` prevents accidental credential leakage in queries.
+ * - Credential Verification: `comparePassword` instance method for constant-time
+ *   bcrypt comparisons during user authentication.
  * ==============================================================================
  */
 
 const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
 
 // Define Schema for User entities
 const userSchema = new mongoose.Schema(
@@ -32,6 +40,13 @@ const userSchema = new mongoose.Schema(
         'Please provide a valid email address'
       ]
     },
+    // Hashed secret password credential (hidden by default from query results)
+    password: {
+      type: String,
+      required: [true, 'Password is required'],
+      minlength: [6, 'Password must be at least 6 characters long'],
+      select: false
+    },
     // Timestamp for account inception
     createdAt: {
       type: Date,
@@ -44,6 +59,28 @@ const userSchema = new mongoose.Schema(
     toObject: { virtuals: true }
   }
 );
+
+/**
+ * Pre-save Mongoose middleware hook.
+ * Automatically hashes the plain-text password using bcryptjs with 10 salt rounds
+ * only when the password field has been modified or newly created.
+ */
+userSchema.pre('save', async function () {
+  // Only hash the password if it has been modified or is new
+  if (!this.isModified('password')) {
+    return;
+  }
+  this.password = await bcrypt.hash(this.password, 10);
+});
+
+/**
+ * Compares a candidate plain-text password with the stored bcrypt hash.
+ * @param {string} candidatePassword - Plain text password to verify
+ * @returns {Promise<boolean>} Resolves true if password matches, false otherwise
+ */
+userSchema.methods.comparePassword = async function (candidatePassword) {
+  return await bcrypt.compare(candidatePassword, this.password);
+};
 
 // Compile and export the User model
 const User = mongoose.model('User', userSchema);

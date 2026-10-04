@@ -4,13 +4,13 @@
  * ==============================================================================
  * Core data schema for Tasks in the Task Manager application.
  *
- * Core Features & Assignments Supported:
+ * Capabilities & Security Specifications:
  * - Core: Title, completion status, creation timestamp.
  * - Assignment 1: Title updates via PUT /tasks/:id.
  * - Assignment 2: Strict category taxonomy ('Work', 'Personal', 'Urgent') with
  *   'Personal' as default.
  * - Assignment 3: Chronological sorting via `createdAt` indexing.
- * - Assignment 4: Relational binding to `User` model via `userId`.
+ * - Assignment 4 & Auth: Relational binding to `User` model via mandatory `userId`.
  * ==============================================================================
  */
 
@@ -33,7 +33,7 @@ const taskSchema = new mongoose.Schema(
       type: Boolean,
       default: false
     },
-    // Assignment 2: Category categorization with strict enum guard
+    // Category classification with strict enum guard
     category: {
       type: String,
       enum: {
@@ -42,14 +42,13 @@ const taskSchema = new mongoose.Schema(
       },
       default: 'Personal'
     },
-    // Assignment 4: Foreign reference to associated User model
+    // Mandatory foreign reference to associated User model for tenant isolation
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
-      required: false,
-      default: null
+      required: [true, 'Task must be assigned to an authenticated user']
     },
-    // Assignment 3: Inception timestamp for asc/desc sorting
+    // Inception timestamp for asc/desc sorting
     createdAt: {
       type: Date,
       default: Date.now
@@ -65,7 +64,7 @@ const taskSchema = new mongoose.Schema(
 // Optimize query performance for multi-tenant and sorting operations
 taskSchema.index({ createdAt: -1 });
 taskSchema.index({ userId: 1, createdAt: -1 });
-taskSchema.index({ category: 1, createdAt: -1 });
+taskSchema.index({ userId: 1, category: 1 });
 
 // Export the Task model and valid categories constant
 const Task = mongoose.model('Task', taskSchema);

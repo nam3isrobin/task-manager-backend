@@ -4,7 +4,7 @@
  * ==============================================================================
  * Comprehensive REST API backend for the Day 19 Task Manager application.
  *
- * Core Capabilities & Assignment Implementations:
+ * Core Capabilities & Assignments:
  * - Core: Full CRUD operations for Tasks with MongoDB persistence via Mongoose.
  * - Assignment 1: Edit task title via PUT /tasks/:id.
  * - Assignment 2: Strict category taxonomy ('Work', 'Personal', 'Urgent') with
@@ -12,13 +12,15 @@
  * - Assignment 3: Chronological task sorting via query param `?sort=asc` or
  *   `?sort=desc` (defaulting to descending).
  * - Assignment 4: Multi-tenant user architecture via User model, endpoints
- *   `GET /users`, `POST /users`, relational linkage `userId`, and filtering via
- *   `GET /tasks?userId=...`.
+ *   `GET /users`, `POST /users`, relational linkage `userId`.
+ * - Day 19 Auth: JWT-based stateless authentication (`/auth/register`, `/auth/login`,
+ *   `/auth/me`), bcrypt password hashing, and strict bearer token verification.
+ * - Tenant Isolation: Strictly prevents cross-user task access (403 Forbidden).
  *
  * Resilience & Operational Standards:
  * - Express 5 compatible middleware and JSON payload body parsing.
  * - CORS enabled for cross-origin client integration.
- * - Static frontend serving from `./public`.
+ * - Static frontend serving from `./public` with fallback JSON status.
  * - Centralized asynchronous error handling and Mongoose CastError / ValidationError handling.
  * - Graceful shutdown handles for process SIGINT / SIGTERM signals.
  * ==============================================================================
@@ -32,6 +34,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
 
 // Import domain schemas
 const User = require('./models/User');
@@ -44,6 +47,7 @@ const app = express();
 // Configuration parameters with fallbacks
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/taskdb';
+const JWT_SECRET = process.env.JWT_SECRET || 'taskmanager_super_secret_jwt_key_2026';
 
 // ==============================================================================
 // 1. Database Connection Management
@@ -96,16 +100,21 @@ app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 // Serve static assets from the public directory (Frontend UI)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Explicit root route: serves frontend if present, otherwise returns clean API status
+// Root route: serves frontend if present, otherwise returns clean API status
 app.get('/', (req, res) => {
   const indexPath = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexPath)) {
     return res.sendFile(indexPath);
   }
-  return res.json({
+  return res.status(200).json({
     status: 'online',
-    message: 'Task Manager API is running live on Render',
+    message: 'Task Manager API is running live',
     endpoints: {
+      auth: {
+        register: 'POST /auth/register',
+        login: 'POST /auth/login',
+        me: 'GET /auth/me'
+      },
       tasks: '/tasks',
       users: '/users',
       health: '/api/health'
@@ -150,34 +159,78 @@ app.get('/api/health', healthHandler);
 app.get('/health', healthHandler);
 
 // ==============================================================================
-// 4. User API Endpoints (Assignment 4: Multiple Users Support)
+// 4. Authentication Middleware
 // ==============================================================================
 
-const userRouter = express.Router();
-
 /**
- * GET /users (or /api/users)
- * Fetch all registered users in descending chronological order.
+ * authMiddleware (protect)
+ * Protects downstream routes by verifying the JSON Web Token in the Authorization header.
+ * Attaches the verified User document to `req.user`.
  */
-userRouter.get('/', async (req, res, next) => {
+const authMiddleware = async (req, res, next) => {
   try {
-    const users = await User.find().sort({ createdAt: -1 });
-    return res.status(200).json(users);
+    const authHeader = req.headers.authorization;
+
+    // Guard: Verify presence of Bearer authorization header
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'No authentication token provided. Please log in.'
+      });
+    }
+
+    const token = authHeader.split(' ')[1];
+    if (!token || !token.trim()) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'No authentication token provided. Please log in.'
+      });
+    }
+
+    // Verify token validity and signature
+    let decoded;
+    try {
+      decoded = jwt.verify(token, JWT_SECRET);
+    } catch (err) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid or expired authentication token'
+      });
+    }
+
+    // Ensure the user corresponding to the token still exists in database
+    const user = await User.findById(decoded.id);
+    if (!user) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'The user belonging to this token no longer exists'
+      });
+    }
+
+    // Attach authenticated user document to request context
+    req.user = user;
+    return next();
   } catch (error) {
     return next(error);
   }
-});
+};
+
+// ==============================================================================
+// 5. Authentication API Routes (/auth & /api/auth)
+// ==============================================================================
+
+const authRouter = express.Router();
 
 /**
- * POST /users (or /api/users)
- * Register a new user profile with a unique username and optional email.
- * Body: { username: string, email?: string }
+ * POST /auth/register (or /api/auth/register)
+ * Registers a new user account with hashed password and signs a JWT token.
+ * Body: { username: string, email?: string, password: string }
  */
-userRouter.post('/', async (req, res, next) => {
+authRouter.post('/register', async (req, res, next) => {
   try {
-    const { username, email } = req.body;
+    const { username, email, password } = req.body;
 
-    // Guard: Verify presence of mandatory username
+    // Guard: Validate mandatory username field
     if (!username || typeof username !== 'string' || !username.trim()) {
       return res.status(400).json({
         error: 'Validation Error',
@@ -186,8 +239,22 @@ userRouter.post('/', async (req, res, next) => {
     }
 
     const trimmedUsername = username.trim();
+    if (trimmedUsername.length < 2) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'Username must be at least 2 characters long'
+      });
+    }
 
-    // Guard: Check for duplicate username proactively to return user-friendly message
+    // Guard: Validate mandatory password field and minlength
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'Password is required and must be at least 6 characters long'
+      });
+    }
+
+    // Guard: Proactively check for duplicate username
     const existingUser = await User.findOne({ username: trimmedUsername });
     if (existingUser) {
       return res.status(409).json({
@@ -196,15 +263,31 @@ userRouter.post('/', async (req, res, next) => {
       });
     }
 
-    // Persist new user entity
+    // Persist new user entity (pre-save hook hashes the password)
     const newUser = await User.create({
       username: trimmedUsername,
-      email: email ? email.trim().toLowerCase() : ''
+      email: email && typeof email === 'string' ? email.trim().toLowerCase() : '',
+      password
     });
 
-    return res.status(201).json(newUser);
+    // Generate signed JSON Web Token
+    const token = jwt.sign(
+      { id: newUser._id, username: newUser.username },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.status(201).json({
+      message: 'User registered successfully',
+      token,
+      user: {
+        id: newUser._id,
+        username: newUser.username,
+        email: newUser.email,
+        createdAt: newUser.createdAt
+      }
+    });
   } catch (error) {
-    // Handle MongoDB duplicate key collision (E11000)
     if (error.code === 11000) {
       return res.status(409).json({
         error: 'Conflict',
@@ -215,48 +298,190 @@ userRouter.post('/', async (req, res, next) => {
   }
 });
 
-// Mount user routes under both /users and /api/users for client flexibility
+/**
+ * POST /auth/login (or /api/auth/login)
+ * Authenticates user credentials and returns a JWT session token.
+ * Body: { username: string, password: string }
+ */
+authRouter.post('/login', async (req, res, next) => {
+  try {
+    const { username, password } = req.body;
+
+    // Guard: Validate input presence
+    if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'Username and password are required'
+      });
+    }
+
+    const trimmedUsername = username.trim();
+
+    // Query user by username, explicitly including password field
+    const user = await User.findOne({ username: trimmedUsername }).select('+password');
+    if (!user) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid username or password'
+      });
+    }
+
+    // Verify candidate password against stored bcrypt hash
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      return res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Invalid username or password'
+      });
+    }
+
+    // Generate signed JWT token
+    const token = jwt.sign(
+      { id: user._id, username: user.username },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    return res.status(200).json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        username: user.username,
+        email: user.email,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * GET /auth/me (or /api/auth/me)
+ * Retrieves currently authenticated user profile from token.
+ */
+authRouter.get('/me', authMiddleware, async (req, res) => {
+  return res.status(200).json({
+    user: {
+      id: req.user._id,
+      username: req.user.username,
+      email: req.user.email,
+      createdAt: req.user.createdAt
+    }
+  });
+});
+
+// Mount authentication router
+app.use('/auth', authRouter);
+app.use('/api/auth', authRouter);
+
+// ==============================================================================
+// 6. User Profile Management API (/users & /api/users)
+// ==============================================================================
+
+const userRouter = express.Router();
+
+/**
+ * GET /users (or /api/users)
+ * Fetch all registered users in descending chronological order (excluding passwords).
+ */
+userRouter.get('/', async (req, res, next) => {
+  try {
+    const users = await User.find().select('-password').sort({ createdAt: -1 });
+    return res.status(200).json(users);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * POST /users (or /api/users)
+ * Register a user profile (compatible with Assignment 4 endpoints).
+ * Body: { username: string, email?: string, password?: string }
+ */
+userRouter.post('/', async (req, res, next) => {
+  try {
+    const { username, email, password } = req.body;
+
+    if (!username || typeof username !== 'string' || !username.trim()) {
+      return res.status(400).json({
+        error: 'Validation Error',
+        message: 'Username is required and cannot be empty'
+      });
+    }
+
+    const trimmedUsername = username.trim();
+    const existingUser = await User.findOne({ username: trimmedUsername });
+    if (existingUser) {
+      return res.status(409).json({
+        error: 'Conflict',
+        message: `Username '${trimmedUsername}' is already taken`
+      });
+    }
+
+    // Default password to secure fallback if not provided in legacy profile creation
+    const userPassword = password && password.length >= 6 ? password : 'Password123!';
+
+    const newUser = await User.create({
+      username: trimmedUsername,
+      email: email ? email.trim().toLowerCase() : '',
+      password: userPassword
+    });
+
+    const userObj = {
+      _id: newUser._id,
+      id: newUser._id,
+      username: newUser.username,
+      email: newUser.email,
+      createdAt: newUser.createdAt
+    };
+
+    return res.status(201).json(userObj);
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(409).json({
+        error: 'Conflict',
+        message: 'A user with that username already exists'
+      });
+    }
+    return next(error);
+  }
+});
+
 app.use('/users', userRouter);
 app.use('/api/users', userRouter);
 
 // ==============================================================================
-// 5. Task API Endpoints (Full CRUD & Assignments 1-4)
+// 7. Protected Task API Endpoints (/tasks & /api/tasks)
 // ==============================================================================
 
 const taskRouter = express.Router();
 
+// Enforce strict authentication on all task operations
+taskRouter.use(authMiddleware);
+
 /**
  * GET /tasks (or /api/tasks)
- * Retrieve tasks with support for:
- * - Assignment 2: Filtering by category (`?category=Work`)
- * - Assignment 3: Sorting by createdAt (`?sort=asc` or `?sort=desc`, default `desc`)
- * - Assignment 4: Filtering by userId (`?userId=...`) and populating user info
- * - Core: Filtering by completed status (`?completed=true` or `?completed=false`)
+ * Retrieve tasks belonging strictly to the authenticated user.
+ * Supports:
+ * - Assignment 2: Category filter (`?category=Work`)
+ * - Assignment 3: Chronological sorting (`?sort=asc` or `?sort=desc`, default `desc`)
+ * - Core: Completed filter (`?completed=true` or `?completed=false`)
  */
 taskRouter.get('/', async (req, res, next) => {
   try {
-    const { userId, category, completed, sort } = req.query;
-    const filterQuery = {};
+    const { category, completed, sort } = req.query;
 
-    // 1. Filter by userId (Assignment 4)
-    if (userId) {
-      if (!mongoose.Types.ObjectId.isValid(userId)) {
-        return res.status(400).json({
-          error: 'Bad Request',
-          message: `Invalid userId format: '${userId}'`
-        });
-      }
-      filterQuery.userId = userId;
-    }
+    // Enforce tenant isolation: query strictly by authenticated user's ID
+    const filterQuery = { userId: req.user._id };
 
-    // 2. Filter by category (Assignment 2)
+    // 1. Filter by category (Assignment 2)
     if (category) {
-      // Check if provided category is valid
-      const normalizedCategory = category.trim();
-      filterQuery.category = normalizedCategory;
+      filterQuery.category = category.trim();
     }
 
-    // 3. Filter by completion status (Core)
+    // 2. Filter by completion status (Core)
     if (completed !== undefined) {
       if (completed === 'true' || completed === true) {
         filterQuery.completed = true;
@@ -265,7 +490,7 @@ taskRouter.get('/', async (req, res, next) => {
       }
     }
 
-    // 4. Chronological sorting (Assignment 3: default desc, asc if explicitly requested)
+    // 3. Chronological sorting (Assignment 3: default desc, asc if explicitly requested)
     const sortDirection = sort && sort.toLowerCase() === 'asc' ? 1 : -1;
 
     // Execute query with relational population of user details
@@ -280,18 +505,51 @@ taskRouter.get('/', async (req, res, next) => {
 });
 
 /**
+ * GET /tasks/:id (or /api/tasks/:id)
+ * Retrieve a single task by ID with tenant isolation verification.
+ */
+taskRouter.get('/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: `Invalid task ID format: '${id}'`
+      });
+    }
+
+    const task = await Task.findById(id).populate('userId', 'username email');
+    if (!task) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: `Task with id '${id}' not found`
+      });
+    }
+
+    // Tenant isolation ownership guard
+    const taskOwnerId = task.userId && task.userId._id ? task.userId._id.toString() : task.userId.toString();
+    if (taskOwnerId !== req.user._id.toString()) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'You are not authorized to view this task'
+      });
+    }
+
+    return res.status(200).json(task);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
  * POST /tasks (or /api/tasks)
- * Create a new task.
- * Body: { title: string, category?: string, userId?: string, completed?: boolean }
- *
- * Validations:
- * - title: required, non-empty trimmed string.
- * - category: if provided, must be in ['Work', 'Personal', 'Urgent']. Default 'Personal'.
- * - userId: if provided, must be valid ObjectId corresponding to an existing User.
+ * Create a new task strictly bound to the authenticated user.
+ * Body: { title: string, category?: string, completed?: boolean }
  */
 taskRouter.post('/', async (req, res, next) => {
   try {
-    const { title, category, userId, completed } = req.body;
+    const { title, category, completed } = req.body;
 
     // Guard: Validate title requirement
     if (!title || typeof title !== 'string' || !title.trim()) {
@@ -313,31 +571,11 @@ taskRouter.post('/', async (req, res, next) => {
       taskCategory = category;
     }
 
-    // Guard: Validate userId if provided (Assignment 4)
-    let assignedUserId = null;
-    if (userId) {
-      if (!mongoose.Types.ObjectId.isValid(userId)) {
-        return res.status(400).json({
-          error: 'Bad Request',
-          message: `Invalid userId format: '${userId}'`
-        });
-      }
-      // Verify user actually exists in the database
-      const existingUser = await User.findById(userId);
-      if (!existingUser) {
-        return res.status(404).json({
-          error: 'Not Found',
-          message: `Associated user with id '${userId}' does not exist`
-        });
-      }
-      assignedUserId = userId;
-    }
-
-    // Create task document
+    // Persist task strictly assigned to the authenticated user's ID
     const createdTask = await Task.create({
       title: title.trim(),
       category: taskCategory,
-      userId: assignedUserId,
+      userId: req.user._id,
       completed: Boolean(completed)
     });
 
@@ -352,13 +590,9 @@ taskRouter.post('/', async (req, res, next) => {
 
 /**
  * PUT /tasks/:id (or /api/tasks/:id)
- * Update existing task properties:
+ * Update existing task properties with ownership verification:
  * - Assignment 1: Edit task title.
  * - Core / Assignment 2: Update completed status or category.
- *
- * Parameters:
- * - :id: Task ObjectId
- * Body: { title?: string, completed?: boolean, category?: string, userId?: string }
  */
 taskRouter.put('/:id', async (req, res, next) => {
   try {
@@ -372,8 +606,26 @@ taskRouter.put('/:id', async (req, res, next) => {
       });
     }
 
-    const { title, completed, category, userId } = req.body;
-    const updateFields = {};
+    const task = await Task.findById(id);
+
+    // Guard: Verify task existence
+    if (!task) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: `Task with id '${id}' not found`
+      });
+    }
+
+    // Guard: Tenant isolation ownership check (403 Forbidden on mismatch)
+    if (task.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'You are not authorized to update this task'
+      });
+    }
+
+    const { title, completed, category } = req.body;
+    let hasUpdates = false;
 
     // Validate and apply title modification (Assignment 1)
     if (title !== undefined) {
@@ -383,12 +635,14 @@ taskRouter.put('/:id', async (req, res, next) => {
           message: 'Task title cannot be empty'
         });
       }
-      updateFields.title = title.trim();
+      task.title = title.trim();
+      hasUpdates = true;
     }
 
     // Validate and apply completed toggle
     if (completed !== undefined) {
-      updateFields.completed = Boolean(completed);
+      task.completed = Boolean(completed);
+      hasUpdates = true;
     }
 
     // Validate and apply category modification (Assignment 2)
@@ -399,54 +653,21 @@ taskRouter.put('/:id', async (req, res, next) => {
           message: `Invalid category '${category}'. Allowed values: ${VALID_CATEGORIES.join(', ')}`
         });
       }
-      updateFields.category = category;
+      task.category = category;
+      hasUpdates = true;
     }
 
-    // Validate and apply userId re-assignment (Assignment 4)
-    if (userId !== undefined) {
-      if (userId === null || userId === '') {
-        updateFields.userId = null;
-      } else {
-        if (!mongoose.Types.ObjectId.isValid(userId)) {
-          return res.status(400).json({
-            error: 'Bad Request',
-            message: `Invalid userId format: '${userId}'`
-          });
-        }
-        const userExists = await User.findById(userId);
-        if (!userExists) {
-          return res.status(404).json({
-            error: 'Not Found',
-            message: `User with id '${userId}' not found`
-          });
-        }
-        updateFields.userId = userId;
-      }
-    }
-
-    // Ensure at least one valid field was provided to update
-    if (Object.keys(updateFields).length === 0) {
+    if (!hasUpdates) {
       return res.status(400).json({
         error: 'Bad Request',
         message: 'No updatable fields provided in request body'
       });
     }
 
-    // Execute atomic update with schema validators enabled (Mongoose 9 compatible)
-    const updatedTask = await Task.findByIdAndUpdate(
-      id,
-      { $set: updateFields },
-      { returnDocument: 'after', runValidators: true }
-    ).populate('userId', 'username email');
+    // Persist updates
+    await task.save();
 
-    // Guard: Verify document existence
-    if (!updatedTask) {
-      return res.status(404).json({
-        error: 'Not Found',
-        message: `Task with id '${id}' not found`
-      });
-    }
-
+    const updatedTask = await Task.findById(task._id).populate('userId', 'username email');
     return res.status(200).json(updatedTask);
   } catch (error) {
     return next(error);
@@ -455,7 +676,7 @@ taskRouter.put('/:id', async (req, res, next) => {
 
 /**
  * DELETE /tasks/:id (or /api/tasks/:id)
- * Permanently delete a task by its ObjectId.
+ * Permanently delete a task by ID with ownership verification.
  */
 taskRouter.delete('/:id', async (req, res, next) => {
   try {
@@ -469,31 +690,41 @@ taskRouter.delete('/:id', async (req, res, next) => {
       });
     }
 
-    const deletedTask = await Task.findByIdAndDelete(id);
+    const task = await Task.findById(id);
 
-    // Guard: Verify document existence
-    if (!deletedTask) {
+    // Guard: Verify task existence
+    if (!task) {
       return res.status(404).json({
         error: 'Not Found',
         message: `Task with id '${id}' not found`
       });
     }
 
+    // Guard: Tenant isolation ownership check (403 Forbidden on mismatch)
+    if (task.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'You are not authorized to delete this task'
+      });
+    }
+
+    await Task.findByIdAndDelete(id);
+
     return res.status(200).json({
       message: 'Task deleted successfully',
-      id: deletedTask._id
+      id: task._id
     });
   } catch (error) {
     return next(error);
   }
 });
 
-// Mount task routes under both /tasks and /api/tasks
+// Mount task routes
 app.use('/tasks', taskRouter);
 app.use('/api/tasks', taskRouter);
 
 // ==============================================================================
-// 6. Centralized Error Handling & 404 Route Guards
+// 8. Centralized Error Handling & 404 Route Guards
 // ==============================================================================
 
 // Catch-all route for unhandled API and application endpoints
@@ -548,7 +779,7 @@ app.use((err, req, res, next) => {
 });
 
 // ==============================================================================
-// 7. Server Listener & Process Signal Handlers
+// 9. Server Listener & Process Signal Handlers
 // ==============================================================================
 
 let server = null;
@@ -606,3 +837,5 @@ module.exports = app;
 module.exports.app = app;
 module.exports.connectDB = connectDB;
 module.exports.server = server;
+module.exports.authMiddleware = authMiddleware;
+module.exports.JWT_SECRET = JWT_SECRET;
