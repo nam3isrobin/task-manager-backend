@@ -53,30 +53,124 @@ const JWT_SECRET = process.env.JWT_SECRET || 'taskmanager_super_secret_jwt_key_2
 // 1. Database Connection Management
 // ==============================================================================
 
+// In-flight concurrency guards to prevent duplicate simultaneous connection/sync operations
+let dbConnectionPromise = null;
+let syncRootAdminPromise = null;
+
+/**
+ * Idempotent root administrator synchronization helper.
+ * Enforces the Strict Single Root Administrator Invariant during system startup.
+ * - Seeds the single root admin if not present using environment variables
+ * - Synchronizes password hash and email if changed in environment
+ */
+const syncRootAdmin = async () => {
+  if (syncRootAdminPromise) {
+    return syncRootAdminPromise;
+  }
+
+  syncRootAdminPromise = (async () => {
+    try {
+      const adminUsername = process.env.ADMIN_USERNAME || 'admin';
+      const adminPassword = process.env.ADMIN_PASSWORD || 'AdminPass123!';
+      const adminEmail = process.env.ADMIN_EMAIL || 'admin@taskmaster.local';
+
+      let adminUser = await User.findOne({ username: adminUsername }).select('+password');
+
+      if (!adminUser) {
+        // Guard: Check if an administrator already exists under an alternate username
+        const existingAdmin = await User.findOne({ role: 'admin' });
+        if (existingAdmin) {
+          console.log(`[RootAdmin] Root administrator already exists as '${existingAdmin.username}'.`);
+          return existingAdmin;
+        }
+
+        adminUser = await User.create({
+          username: adminUsername,
+          email: adminEmail,
+          password: adminPassword,
+          role: 'admin'
+        });
+        console.log(`[RootAdmin] Root administrator '${adminUsername}' initialized successfully.`);
+        return adminUser;
+      }
+
+      // Existing admin account: verify if role, password, or email need updating
+      let needsSave = false;
+      if (adminUser.role !== 'admin') {
+        adminUser.role = 'admin';
+        needsSave = true;
+      }
+      if (adminEmail && adminUser.email !== adminEmail) {
+        adminUser.email = adminEmail;
+        needsSave = true;
+      }
+      const isPasswordMatch = await adminUser.comparePassword(adminPassword);
+      if (!isPasswordMatch) {
+        adminUser.password = adminPassword; // Pre-save hook rehashes
+        needsSave = true;
+      }
+
+      if (needsSave) {
+        await adminUser.save();
+        console.log(`[RootAdmin] Root administrator '${adminUsername}' credentials updated.`);
+      }
+
+      return adminUser;
+    } catch (error) {
+      console.error(`[RootAdmin] Synchronization failed: ${error.message}`);
+      throw error;
+    } finally {
+      syncRootAdminPromise = null;
+    }
+  })();
+
+  return syncRootAdminPromise;
+};
+
 /**
  * Connect to MongoDB instance using Mongoose.
- * Provides connection state logging and error diagnostics.
+ * Provides connection state logging, auto-indexing, and root administrator synchronization.
  */
 const connectDB = async () => {
-  if (mongoose.connection.readyState >= 1) {
+  if (mongoose.connection.readyState === 1) {
+    try {
+      await syncRootAdmin();
+    } catch (err) {
+      console.warn('[RootAdmin] Sync notice:', err.message);
+    }
     return mongoose.connection;
   }
 
-  try {
-    const conn = await mongoose.connect(MONGO_URI, {
-      serverSelectionTimeoutMS: 5000,
-      autoIndex: true
-    });
-    console.log(`[MongoDB] Connected to database: ${conn.connection.name} @ ${conn.connection.host}`);
-    return conn;
-  } catch (error) {
-    console.error(`[MongoDB] Connection failed: ${error.message}`);
-    // If not in a test environment, let the app fail fast if database is unreachable
-    if (process.env.NODE_ENV !== 'test' && require.main === module) {
-      process.exit(1);
-    }
-    throw error;
+  if (dbConnectionPromise) {
+    return dbConnectionPromise;
   }
+
+  dbConnectionPromise = (async () => {
+    try {
+      const conn = await mongoose.connect(MONGO_URI, {
+        serverSelectionTimeoutMS: 5000,
+        autoIndex: true
+      });
+      console.log(`[MongoDB] Connected to database: ${conn.connection.name} @ ${conn.connection.host}`);
+      try {
+        await syncRootAdmin();
+      } catch (err) {
+        console.warn('[RootAdmin] Sync notice:', err.message);
+      }
+      return conn;
+    } catch (error) {
+      console.error(`[MongoDB] Connection failed: ${error.message}`);
+      // If not in a test environment, let the app fail fast if database is unreachable
+      if (process.env.NODE_ENV !== 'test' && require.main === module) {
+        process.exit(1);
+      }
+      throw error;
+    } finally {
+      dbConnectionPromise = null;
+    }
+  })();
+
+  return dbConnectionPromise;
 };
 
 // Initiate database connection
@@ -215,6 +309,48 @@ const authMiddleware = async (req, res, next) => {
   }
 };
 
+/**
+ * adminMiddleware
+ * Combines authentication token verification with strict administrator role authorization.
+ * - If not authenticated -> 401 Unauthorized
+ * - If authenticated but req.user.role !== 'admin' -> 403 Forbidden
+ */
+const adminMiddleware = async (req, res, next) => {
+  try {
+    // If request user is not already attached by authMiddleware, run authMiddleware first
+    if (!req.user) {
+      let authError = null;
+      await new Promise((resolve) => {
+        authMiddleware(req, res, (err) => {
+          if (err) authError = err;
+          resolve();
+        });
+      });
+
+      if (authError) {
+        return next(authError);
+      }
+
+      // If authMiddleware sent a response (e.g., 401 Unauthorized), stop execution
+      if (res.headersSent) {
+        return;
+      }
+    }
+
+    // Enforce administrator privilege check
+    if (!req.user || req.user.role !== 'admin') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'Access denied: Administrator privileges required.'
+      });
+    }
+
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
 // ==============================================================================
 // 5. Authentication API Routes (/auth & /api/auth)
 // ==============================================================================
@@ -264,15 +400,17 @@ authRouter.post('/register', async (req, res, next) => {
     }
 
     // Persist new user entity (pre-save hook hashes the password)
+    // Security Guard: Single Root Administrator Invariant - public registration strictly forces role: 'user'
     const newUser = await User.create({
       username: trimmedUsername,
       email: email && typeof email === 'string' ? email.trim().toLowerCase() : '',
-      password
+      password,
+      role: 'user'
     });
 
-    // Generate signed JSON Web Token
+    // Generate signed JSON Web Token including user role
     const token = jwt.sign(
-      { id: newUser._id, username: newUser.username },
+      { id: newUser._id, username: newUser.username, role: newUser.role },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -281,9 +419,11 @@ authRouter.post('/register', async (req, res, next) => {
       message: 'User registered successfully',
       token,
       user: {
+        _id: newUser._id,
         id: newUser._id,
         username: newUser.username,
         email: newUser.email,
+        role: newUser.role,
         createdAt: newUser.createdAt
       }
     });
@@ -335,9 +475,9 @@ authRouter.post('/login', async (req, res, next) => {
       });
     }
 
-    // Generate signed JWT token
+    // Generate signed JWT token including user role
     const token = jwt.sign(
-      { id: user._id, username: user.username },
+      { id: user._id, username: user.username, role: user.role },
       JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -346,9 +486,11 @@ authRouter.post('/login', async (req, res, next) => {
       message: 'Login successful',
       token,
       user: {
+        _id: user._id,
         id: user._id,
         username: user.username,
         email: user.email,
+        role: user.role,
         createdAt: user.createdAt
       }
     });
@@ -364,9 +506,11 @@ authRouter.post('/login', async (req, res, next) => {
 authRouter.get('/me', authMiddleware, async (req, res) => {
   return res.status(200).json({
     user: {
+      _id: req.user._id,
       id: req.user._id,
       username: req.user.username,
       email: req.user.email,
+      role: req.user.role,
       createdAt: req.user.createdAt
     }
   });
@@ -426,7 +570,8 @@ userRouter.post('/', async (req, res, next) => {
     const newUser = await User.create({
       username: trimmedUsername,
       email: email ? email.trim().toLowerCase() : '',
-      password: userPassword
+      password: userPassword,
+      role: 'user'
     });
 
     const userObj = {
@@ -434,6 +579,7 @@ userRouter.post('/', async (req, res, next) => {
       id: newUser._id,
       username: newUser.username,
       email: newUser.email,
+      role: newUser.role,
       createdAt: newUser.createdAt
     };
 
@@ -724,7 +870,228 @@ app.use('/tasks', taskRouter);
 app.use('/api/tasks', taskRouter);
 
 // ==============================================================================
-// 8. Centralized Error Handling & 404 Route Guards
+// 8. Administrator UI Static Serving & API Routes (/api/admin & /admin)
+// ==============================================================================
+
+/**
+ * Static serving handler for the Administrator Dashboard.
+ * Serves public/admin.html if present, otherwise redirects to /admin.html.
+ */
+app.get('/admin', (req, res) => {
+  const adminPath = path.join(__dirname, 'public', 'admin.html');
+  if (fs.existsSync(adminPath)) {
+    return res.sendFile(adminPath);
+  }
+  return res.redirect('/admin.html');
+});
+
+const adminRouter = express.Router();
+
+// Enforce admin privileges across all administrative endpoints
+adminRouter.use(adminMiddleware);
+
+/**
+ * GET /api/admin/metrics (or /admin/metrics)
+ * Returns operational telemetry and aggregate system metrics.
+ */
+adminRouter.get('/metrics', async (req, res, next) => {
+  try {
+    const [totalUsers, totalTasks, completedTasks] = await Promise.all([
+      User.countDocuments(),
+      Task.countDocuments(),
+      Task.countDocuments({ completed: true })
+    ]);
+
+    const activeTasks = totalTasks - completedTasks;
+    const completionRate = totalTasks > 0
+      ? Math.round((completedTasks / totalTasks) * 10000) / 100
+      : 0;
+
+    const dbState = mongoose.connection.readyState;
+    const dbStatusMap = {
+      0: 'disconnected',
+      1: 'connected',
+      2: 'connecting',
+      3: 'disconnecting'
+    };
+
+    return res.status(200).json({
+      totalUsers,
+      totalTasks,
+      completedTasks,
+      activeTasks,
+      completionRate,
+      databaseStatus: dbStatusMap[dbState] || 'unknown',
+      uptime: process.uptime()
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * GET /api/admin/users (or /admin/users)
+ * Returns all registered users with their individual task counts.
+ * Schema: [{ _id, username, email, role, createdAt, taskCount }]
+ */
+adminRouter.get('/users', async (req, res, next) => {
+  try {
+    const users = await User.find().select('-password').sort({ createdAt: -1 });
+
+    // Aggregate task counts grouped by userId
+    const taskCounts = await Task.aggregate([
+      { $group: { _id: '$userId', count: { $sum: 1 } } }
+    ]);
+
+    const countMap = {};
+    taskCounts.forEach((item) => {
+      if (item._id) {
+        countMap[item._id.toString()] = item.count;
+      }
+    });
+
+    const usersWithCounts = users.map((u) => ({
+      _id: u._id,
+      id: u._id,
+      username: u.username,
+      email: u.email || '',
+      role: u.role || 'user',
+      createdAt: u.createdAt,
+      taskCount: countMap[u._id.toString()] || 0
+    }));
+
+    return res.status(200).json(usersWithCounts);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * DELETE /api/admin/users/:id (or /admin/users/:id)
+ * Deletes user and cascades deletion of all tasks owned by this user.
+ * Validates ObjectId and strictly prevents deletion of root administrator.
+ */
+adminRouter.delete('/users/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Guard: Validate ObjectId format
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: `Invalid user ID format: '${id}'`
+      });
+    }
+
+    const userToDelete = await User.findById(id);
+    if (!userToDelete) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: `User with id '${id}' not found`
+      });
+    }
+
+    // Guard: Prevent deletion of the root administrator account
+    const rootAdminUsername = process.env.ADMIN_USERNAME || 'admin';
+    if (userToDelete.role === 'admin' || userToDelete.username === rootAdminUsername) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: 'Cannot delete root administrator'
+      });
+    }
+
+    // Cascade delete all tasks belonging to this user
+    const deleteResult = await Task.deleteMany({ userId: id });
+
+    // Remove user account
+    await User.findByIdAndDelete(id);
+
+    return res.status(200).json({
+      message: 'User and associated tasks deleted successfully',
+      deletedUserId: id,
+      deletedTasksCount: deleteResult.deletedCount
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * GET /api/admin/tasks (or /admin/tasks)
+ * Returns all tasks across all users, populated with userId: 'username email'.
+ * Supports category and completed filtering, plus sort ordering.
+ */
+adminRouter.get('/tasks', async (req, res, next) => {
+  try {
+    const { category, completed, sort } = req.query;
+    const filterQuery = {};
+
+    // 1. Filter by category
+    if (category) {
+      filterQuery.category = category.trim();
+    }
+
+    // 2. Filter by completion status
+    if (completed !== undefined) {
+      if (completed === 'true' || completed === true) {
+        filterQuery.completed = true;
+      } else if (completed === 'false' || completed === false) {
+        filterQuery.completed = false;
+      }
+    }
+
+    // 3. Chronological sorting
+    const sortDirection = sort && sort.toLowerCase() === 'asc' ? 1 : -1;
+
+    const tasks = await Task.find(filterQuery)
+      .sort({ createdAt: sortDirection })
+      .populate('userId', 'username email');
+
+    return res.status(200).json(tasks);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * DELETE /api/admin/tasks/:id (or /admin/tasks/:id)
+ * Admin can delete any task regardless of owner.
+ */
+adminRouter.delete('/tasks/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+
+    // Guard: Validate ObjectId format
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        error: 'Bad Request',
+        message: `Invalid task ID format: '${id}'`
+      });
+    }
+
+    const deletedTask = await Task.findByIdAndDelete(id);
+    if (!deletedTask) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: `Task with id '${id}' not found`
+      });
+    }
+
+    return res.status(200).json({
+      message: 'Task deleted by administrator',
+      id: deletedTask._id
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+// Mount administrator router on both /api/admin and /admin
+app.use('/api/admin', adminRouter);
+app.use('/admin', adminRouter);
+
+// ==============================================================================
+// 9. Centralized Error Handling & 404 Route Guards
 // ==============================================================================
 
 // Catch-all route for unhandled API and application endpoints
@@ -838,4 +1205,6 @@ module.exports.app = app;
 module.exports.connectDB = connectDB;
 module.exports.server = server;
 module.exports.authMiddleware = authMiddleware;
+module.exports.adminMiddleware = adminMiddleware;
+module.exports.syncRootAdmin = syncRootAdmin;
 module.exports.JWT_SECRET = JWT_SECRET;

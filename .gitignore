@@ -10,3 +10,6 @@ yarn-error.log*
 coverage/
 *.pem
 *.key
+.codegraph/
+.agents/
+.specify/

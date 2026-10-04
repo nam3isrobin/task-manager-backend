@@ -22,6 +22,13 @@ Full-stack Task Manager Express REST API with MongoDB persistence, JWT Bearer au
 - `PUT /tasks/:id`: Update task (`title`, `completed`, `category`)
 - `DELETE /tasks/:id`: Delete task (strictly isolated to owner)
 
+### Administrator Endpoints (Requires `role: 'admin'`)
+- `GET /api/admin/metrics`: Real-time system telemetry (total users, total tasks, completion rates, uptime)
+- `GET /api/admin/users`: User directory with individual task count aggregation
+- `DELETE /api/admin/users/:id`: Cascading deletion of user and all owned tasks (root admin protected)
+- `GET /api/admin/tasks`: Global cross-tenant task explorer with owner details
+- `DELETE /api/admin/tasks/:id`: Administrative task deletion
+
 ### Legacy & Telemetry
 - `GET /users`: List users (sanitized, no password hashes)
 - `POST /users`: Legacy user creation
@@ -31,8 +38,10 @@ Full-stack Task Manager Express REST API with MongoDB persistence, JWT Bearer au
 ```bash
 npm install
 cp .env.example .env
+npm run seed  # Idempotent database seeder (root admin & demo tasks)
 npm start
 ```
 Default URL: `http://localhost:3000` (auto-increments on port collision)
-Test Suite: `npm test` (48 automated assertions)
+Test Suite: `npm test` (61 automated assertions)
+
 

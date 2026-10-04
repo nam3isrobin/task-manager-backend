@@ -24,6 +24,9 @@ process.env.NODE_ENV = 'test';
 process.env.PORT = '3099';
 process.env.MONGO_URI = 'mongodb://127.0.0.1:27017/taskdb_test';
 process.env.JWT_SECRET = 'test_jwt_secret_key_day19_deterministic_2026';
+process.env.ADMIN_USERNAME = 'admin';
+process.env.ADMIN_PASSWORD = 'AdminPass123!';
+process.env.ADMIN_EMAIL = 'admin@taskmaster.local';
 
 const app = require('../server');
 const User = require('../models/User');
@@ -34,6 +37,9 @@ describe('Day 19 Task Manager API Test Suite (Auth + Multi-Tenancy)', () => {
   let user1Data = null;
   let user2Token = null;
   let user2Data = null;
+
+  let adminToken = null;
+  let adminUser = null;
 
   let user1TaskId = null;
   let user2TaskId = null;
@@ -217,6 +223,23 @@ describe('Day 19 Task Manager API Test Suite (Auth + Multi-Tenancy)', () => {
       assert.equal(res.body.user.username, 'alice_quant');
       assert.equal(res.body.user.email, 'alice@example.com');
       assert.equal(res.body.user.id, user1Data.id);
+    });
+
+    it('POST /auth/register should prevent public registration from assigning admin role (defaults to user)', async () => {
+      const res = await request(app)
+        .post('/auth/register')
+        .send({
+          username: 'sneaky_admin_attempt',
+          email: 'sneaky@example.com',
+          password: 'Password123!',
+          role: 'admin'
+        });
+
+      assert.equal(res.status, 201);
+      assert.equal(res.body.user.role, 'user');
+
+      const userInDb = await User.findOne({ username: 'sneaky_admin_attempt' });
+      assert.equal(userInDb.role, 'user');
     });
   });
 
@@ -621,7 +644,241 @@ describe('Day 19 Task Manager API Test Suite (Auth + Multi-Tenancy)', () => {
   });
 
   // ============================================================================
-  // 8. Error Handling Middleware & 404 Route Guards
+  // 8. Single Root Administrator & Schema Invariants
+  // ============================================================================
+  describe('Single Root Administrator & Schema Invariants', () => {
+    it('Single root admin schema validator prevents secondary admin creation', async () => {
+      // Ensure the single root administrator is seeded
+      adminUser = await app.syncRootAdmin();
+      assert.ok(adminUser);
+      assert.equal(adminUser.role, 'admin');
+
+      // Attempting to create a second admin must be rejected by Mongoose pre-save hook
+      await assert.rejects(
+        async () => {
+          await User.create({
+            username: 'secondary_admin_candidate',
+            password: 'Password123!',
+            role: 'admin'
+          });
+        },
+        (err) => {
+          assert.match(
+            err.message,
+            /A root administrator already exists\. Secondary administrators are strictly forbidden\./i
+          );
+          return true;
+        }
+      );
+    });
+
+    it('Idempotent syncRootAdmin updates password hash if environment password changes', async () => {
+      const admin = await app.syncRootAdmin();
+      assert.ok(admin);
+      const isMatch = await admin.comparePassword(process.env.ADMIN_PASSWORD || 'AdminPass123!');
+      assert.equal(isMatch, true);
+    });
+  });
+
+  // ============================================================================
+  // 9. Administrator API Endpoints (/api/admin & /admin)
+  // ============================================================================
+  describe('Administrator API Endpoints (/api/admin & /admin)', () => {
+    before(async () => {
+      // Authenticate as root administrator
+      adminUser = await app.syncRootAdmin();
+      const loginRes = await request(app)
+        .post('/auth/login')
+        .send({
+          username: process.env.ADMIN_USERNAME || 'admin',
+          password: process.env.ADMIN_PASSWORD || 'AdminPass123!'
+        });
+
+      assert.equal(loginRes.status, 200);
+      assert.ok(loginRes.body.token);
+      adminToken = loginRes.body.token;
+    });
+
+    // --------------------------------------------------------------------------
+    // 9.1 Metrics Endpoint (/api/admin/metrics)
+    // --------------------------------------------------------------------------
+    it('GET /api/admin/metrics should reject unauthenticated request with 401', async () => {
+      const res = await request(app).get('/api/admin/metrics');
+      assert.equal(res.status, 401);
+      assert.equal(res.body.error, 'Unauthorized');
+    });
+
+    it('GET /api/admin/metrics should reject non-admin authenticated user with 403 Forbidden', async () => {
+      const res = await request(app)
+        .get('/api/admin/metrics')
+        .set('Authorization', `Bearer ${user1Token}`);
+      assert.equal(res.status, 403);
+      assert.equal(res.body.error, 'Forbidden');
+      assert.match(res.body.message, /Administrator privileges required/i);
+    });
+
+    it('GET /api/admin/metrics should return operational metrics for root administrator', async () => {
+      const res = await request(app)
+        .get('/api/admin/metrics')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      assert.equal(res.status, 200);
+      assert.ok(typeof res.body.totalUsers === 'number');
+      assert.ok(typeof res.body.totalTasks === 'number');
+      assert.ok(typeof res.body.completedTasks === 'number');
+      assert.ok(typeof res.body.activeTasks === 'number');
+      assert.ok(typeof res.body.completionRate === 'number');
+      assert.equal(res.body.databaseStatus, 'connected');
+      assert.ok(typeof res.body.uptime === 'number');
+    });
+
+    // --------------------------------------------------------------------------
+    // 9.2 Users List Endpoint (/api/admin/users)
+    // --------------------------------------------------------------------------
+    it('GET /api/admin/users should reject request without admin credentials (401 & 403)', async () => {
+      const unauth = await request(app).get('/api/admin/users');
+      assert.equal(unauth.status, 401);
+
+      const forbidden = await request(app)
+        .get('/api/admin/users')
+        .set('Authorization', `Bearer ${user1Token}`);
+      assert.equal(forbidden.status, 403);
+    });
+
+    it('GET /api/admin/users should return all users with individual task counts for admin', async () => {
+      const res = await request(app)
+        .get('/api/admin/users')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      assert.equal(res.status, 200);
+      assert.ok(Array.isArray(res.body));
+      assert.ok(res.body.length >= 2);
+
+      res.body.forEach((u) => {
+        assert.ok(u._id);
+        assert.ok(u.username);
+        assert.ok(u.role);
+        assert.ok(typeof u.taskCount === 'number');
+        assert.equal(u.password, undefined);
+      });
+    });
+
+    // --------------------------------------------------------------------------
+    // 9.3 Cascade User Deletion (/api/admin/users/:id)
+    // --------------------------------------------------------------------------
+    it('DELETE /api/admin/users/:id should reject invalid ObjectId format with 400', async () => {
+      const res = await request(app)
+        .delete('/api/admin/users/invalid-id')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /Invalid user ID format/i);
+    });
+
+    it('DELETE /api/admin/users/:id should reject attempt to delete root administrator (400 Bad Request)', async () => {
+      const res = await request(app)
+        .delete(`/api/admin/users/${adminUser._id}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      assert.equal(res.status, 400);
+      assert.match(res.body.message, /Cannot delete root administrator/i);
+    });
+
+    it('DELETE /api/admin/users/:id should cascade delete user and all owned tasks', async () => {
+      // 1. Create a temporary user with associated tasks
+      const victim = await User.create({
+        username: 'cascade_victim_user',
+        email: 'victim@taskmaster.local',
+        password: 'Password123!',
+        role: 'user'
+      });
+
+      await Task.create([
+        { title: 'Victim Task 1', category: 'Work', userId: victim._id },
+        { title: 'Victim Task 2', category: 'Urgent', userId: victim._id }
+      ]);
+
+      const victimTasksBefore = await Task.countDocuments({ userId: victim._id });
+      assert.equal(victimTasksBefore, 2);
+
+      // 2. Admin performs cascade delete
+      const deleteRes = await request(app)
+        .delete(`/api/admin/users/${victim._id}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      assert.equal(deleteRes.status, 200);
+      assert.match(deleteRes.body.message, /User and associated tasks deleted successfully/i);
+      assert.equal(deleteRes.body.deletedUserId, victim._id.toString());
+      assert.equal(deleteRes.body.deletedTasksCount, 2);
+
+      // 3. Verify user and tasks are purged
+      const victimInDb = await User.findById(victim._id);
+      assert.equal(victimInDb, null);
+
+      const victimTasksAfter = await Task.find({ userId: victim._id });
+      assert.equal(victimTasksAfter.length, 0);
+    });
+
+    // --------------------------------------------------------------------------
+    // 9.4 Cross-Tenant Tasks Retrieval (/api/admin/tasks)
+    // --------------------------------------------------------------------------
+    it('GET /api/admin/tasks should return all tasks across users with populated userId', async () => {
+      const unauth = await request(app).get('/api/admin/tasks');
+      assert.equal(unauth.status, 401);
+
+      const forbidden = await request(app)
+        .get('/api/admin/tasks')
+        .set('Authorization', `Bearer ${user1Token}`);
+      assert.equal(forbidden.status, 403);
+
+      const res = await request(app)
+        .get('/api/admin/tasks')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      assert.equal(res.status, 200);
+      assert.ok(Array.isArray(res.body));
+      assert.ok(res.body.length >= 1);
+
+      // Check population
+      const firstTask = res.body[0];
+      assert.ok(firstTask.userId);
+      assert.ok(typeof firstTask.userId === 'object');
+      assert.ok(firstTask.userId.username);
+
+      // Verify category filter
+      const workFiltered = await request(app)
+        .get('/api/admin/tasks?category=Work')
+        .set('Authorization', `Bearer ${adminToken}`);
+      assert.equal(workFiltered.status, 200);
+      workFiltered.body.forEach((t) => assert.equal(t.category, 'Work'));
+    });
+
+    // --------------------------------------------------------------------------
+    // 9.5 Task Deletion by Admin (/api/admin/tasks/:id)
+    // --------------------------------------------------------------------------
+    it('DELETE /api/admin/tasks/:id should allow admin to delete any task regardless of owner', async () => {
+      // Create a task owned by user 1
+      const taskToDelete = await Task.create({
+        title: 'Task to be purged by administrator',
+        category: 'Personal',
+        userId: user1Data.id || user1Data._id
+      });
+
+      const res = await request(app)
+        .delete(`/api/admin/tasks/${taskToDelete._id}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      assert.equal(res.status, 200);
+      assert.match(res.body.message, /Task deleted by administrator/i);
+      assert.equal(res.body.id.toString(), taskToDelete._id.toString());
+
+      const checkInDb = await Task.findById(taskToDelete._id);
+      assert.equal(checkInDb, null);
+    });
+  });
+
+  // ============================================================================
+  // 10. Error Handling Middleware & 404 Route Guards
   // ============================================================================
   describe('Error Handling Middleware', () => {
     it('Should return 404 for undefined routes', async () => {
