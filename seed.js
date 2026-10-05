@@ -6,8 +6,7 @@
  *
  * Capabilities:
  * - Establishes resilient connection to MongoDB using MONGO_URI from .env
- * - Synchronizes the single root administrator (admin / AdminPass123!)
- * - Populates rich sample demo users and multi-category tasks ('Work', 'Personal', 'Urgent')
+ * - Populates rich sample demo user and multi-category tasks ('Work', 'Personal', 'Urgent')
  * - Idempotent: can be executed multiple times safely without duplicate key violations
  * ==============================================================================
  */
@@ -21,7 +20,7 @@ const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/taskdb';
 
 /**
  * Main seeding workflow.
- * Connects to MongoDB, seeds root admin, demo user, and initial tasks.
+ * Connects to MongoDB, seeds demo user, and initial tasks.
  */
 async function seedDatabase() {
   console.log('====================================================');
@@ -37,51 +36,7 @@ async function seedDatabase() {
     });
     console.log('[MongoDB] Connected successfully.');
 
-    // 2. Seed / Synchronize Root Administrator
-    const adminUsername = process.env.ADMIN_USERNAME || 'admin';
-    const adminPassword = process.env.ADMIN_PASSWORD || 'AdminPass123!';
-    const adminEmail = process.env.ADMIN_EMAIL || 'admin@taskmaster.local';
-
-    let admin = await User.findOne({ username: adminUsername }).select('+password');
-    if (!admin) {
-      // Check if an admin already exists under an alternate username
-      const existingAdmin = await User.findOne({ role: 'admin' });
-      if (!existingAdmin) {
-        admin = await User.create({
-          username: adminUsername,
-          email: adminEmail,
-          password: adminPassword,
-          role: 'admin'
-        });
-        console.log(`✅ Root Administrator created: ${adminUsername} (${adminEmail})`);
-      } else {
-        admin = existingAdmin;
-        console.log(`ℹ️ Existing Root Administrator verified: ${admin.username}`);
-      }
-    } else {
-      let updated = false;
-      if (admin.role !== 'admin') {
-        admin.role = 'admin';
-        updated = true;
-      }
-      const isMatch = await admin.comparePassword(adminPassword);
-      if (!isMatch) {
-        admin.password = adminPassword; // Pre-save hook rehashes
-        updated = true;
-      }
-      if (adminEmail && admin.email !== adminEmail) {
-        admin.email = adminEmail;
-        updated = true;
-      }
-      if (updated) {
-        await admin.save();
-        console.log(`🔄 Root Administrator synchronized: ${adminUsername}`);
-      } else {
-        console.log(`ℹ️ Root Administrator up-to-date: ${adminUsername}`);
-      }
-    }
-
-    // 3. Seed / Synchronize Demo Regular User
+    // 2. Seed / Synchronize Demo Regular User
     const demoUsername = 'demo_user';
     const demoPassword = 'UserPass123!';
     const demoEmail = 'demo@taskmaster.local';
@@ -91,27 +46,20 @@ async function seedDatabase() {
       demoUser = await User.create({
         username: demoUsername,
         email: demoEmail,
-        password: demoPassword,
-        role: 'user'
+        password: demoPassword
       });
       console.log(`✅ Demo User created: ${demoUsername} (${demoEmail})`);
     } else {
       console.log(`ℹ️ Demo User verified: ${demoUsername}`);
     }
 
-    // 4. Seed Initial Multi-Category Tasks
+    // 3. Seed Initial Multi-Category Tasks
     const sampleTasks = [
       {
-        title: 'Review Day 19 REST API Architecture & Admin Routes',
+        title: 'Review Day 19 REST API Architecture & Task Endpoints',
         category: 'Work',
         completed: true,
-        userId: admin._id
-      },
-      {
-        title: 'Perform System Security & Invariant Audit',
-        category: 'Urgent',
-        completed: false,
-        userId: admin._id
+        userId: demoUser._id
       },
       {
         title: 'Set up local MongoDB development environment',

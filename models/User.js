@@ -47,15 +47,6 @@ const userSchema = new mongoose.Schema(
       minlength: [6, 'Password must be at least 6 characters long'],
       select: false
     },
-    // Authorization access control level ('user' or 'admin')
-    role: {
-      type: String,
-      enum: {
-        values: ['user', 'admin'],
-        message: 'Role must be either "user" or "admin"'
-      },
-      default: 'user'
-    },
     // Timestamp for account inception
     createdAt: {
       type: Date,
@@ -71,28 +62,13 @@ const userSchema = new mongoose.Schema(
 
 /**
  * Pre-save Mongoose middleware hook.
- * 1. Automatically hashes the plain-text password using bcryptjs with 10 salt rounds
- *    only when the password field has been modified or newly created.
- * 2. Enforces the Strict Single Root Administrator Invariant:
- *    Guarantees at the database schema level that only one root administrator can exist.
+ * Automatically hashes the plain-text password using bcryptjs with 10 salt rounds
+ * only when the password field has been modified or newly created.
  */
 userSchema.pre('save', async function () {
   // Only hash the password if it has been modified or is new
   if (this.isModified('password')) {
     this.password = await bcrypt.hash(this.password, 10);
-  }
-
-  // Strict Single Root Administrator Invariant:
-  // If this document is an admin and either newly created or elevated,
-  // verify no secondary root administrator is being introduced into the system.
-  if (this.role === 'admin' && (this.isNew || this.isModified('role'))) {
-    const adminCount = await mongoose.model('User').countDocuments({ role: 'admin' });
-    if (adminCount >= 1) {
-      const existingAdmin = await mongoose.model('User').findOne({ role: 'admin' });
-      if (existingAdmin && this._id.toString() !== existingAdmin._id.toString()) {
-        throw new Error('A root administrator already exists. Secondary administrators are strictly forbidden.');
-      }
-    }
   }
 });
 
